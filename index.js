@@ -64,6 +64,192 @@ async function run() {
       }
     };
 
+
+    // verify admin
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded.email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    // Search a user by email
+    app.get("/users/search", async (req, res) => {
+      try {
+        const email = req.query.email;
+
+        // Check if email is provided
+        if (!email) {
+          return res.status(400).send({
+            message: "Email is required",
+          });
+        }
+
+        // Find user by email
+        const user = await usersCollection.findOne({
+          email: { $regex: `^${email}$`, $options: "i" },
+        });
+
+        // If user does not exist
+        if (!user) {
+          return res.status(404).send({
+            message: "User not found",
+          });
+        }
+
+        // Send user data
+        res.send(user);
+      } catch (error) {
+        console.error("Failed to search user:", error);
+
+        res.status(500).send({
+          message: "Failed to search user",
+        });
+      }
+    });
+
+    // Suggest users by email
+    app.get("/users/suggestions", async (req, res) => {
+      try {
+        const email = req.query.email;
+
+        // If email is empty
+        if (!email) {
+          return res.send([]);
+        }
+
+        // Find users whose email starts with the searched text
+        const users = await usersCollection
+          .find({
+            email: {
+              $regex: `^${email}`,
+              $options: "i",
+            },
+          })
+          .project({
+            email: 1,
+            role: 1,
+            created_at: 1,
+            last_log_in: 1,
+          })
+          .limit(10)
+          .toArray();
+
+        // Send user suggestions
+        res.send(users);
+      } catch (error) {
+        console.error("Failed to get user suggestions:", error);
+
+        res.status(500).send({
+          message: "Failed to get user suggestions",
+        });
+      }
+    });
+
+    // Get user role by email
+    app.get("/users/role/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+
+        // Find user by email
+        const user = await usersCollection.findOne(
+          { email: email },
+          { projection: { role: 1 } },
+        );
+
+        // User not found
+        if (!user) {
+          return res.status(404).send({
+            message: "User not found",
+          });
+        }
+
+        // Send role
+        res.send({
+          role: user.role || "user",
+        });
+      } catch (error) {
+        console.error("Failed to get user role:", error);
+
+        res.status(500).send({
+          message: "Failed to get user role",
+        });
+      }
+    });
+
+    // Make a user admin
+    app.patch("/users/:id/make-admin", verifyFBToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        // Update user's role to admin
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              role: "admin",
+            },
+          },
+        );
+
+        // User not found
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            message: "User not found",
+          });
+        }
+
+        // Successfully made admin
+        res.send({
+          message: "User is now an admin",
+        });
+      } catch (error) {
+        console.error("Failed to make admin:", error);
+
+        res.status(500).send({
+          message: "Failed to make admin",
+        });
+      }
+    });
+
+    // Remove admin role from a user
+    app.patch("/users/:id/remove-admin", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        // Remove the admin role
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              role: "user",
+            },
+          },
+        );
+
+        // User not found
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            message: "User not found",
+          });
+        }
+
+        // Successfully removed admin role
+        res.send({
+          message: "Admin role removed",
+        });
+      } catch (error) {
+        console.error("Failed to remove admin:", error);
+
+        res.status(500).send({
+          message: "Failed to remove admin",
+        });
+      }
+    });
+
     // =========================
     // Users
     // =========================
@@ -236,7 +422,7 @@ async function run() {
     });
 
     // get pending riders
-    app.get("/riders/pending", async (req, res) => {
+    app.get("/riders/pending", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
         const query = { status: "pending" };
 
@@ -253,7 +439,7 @@ async function run() {
     });
 
     // get active riders
-    app.get("/riders/active", async (req, res) => {
+    app.get("/riders/active", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
         // Find all riders whose status is active
         const query = {
@@ -277,10 +463,25 @@ async function run() {
     // update rider status
     app.patch("/riders/:id/status", async (req, res) => {
       try {
+        // Get rider ID from URL
         const { id } = req.params;
+
+        // Get new status from request body
         const { status } = req.body;
 
-        // Find rider by MongoDB _id and update status
+        // Find the rider using MongoDB _id
+        const rider = await ridersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        // If rider is not found
+        if (!rider) {
+          return res.status(404).send({
+            message: "Rider not found",
+          });
+        }
+
+        // Update rider status
         const result = await ridersCollection.updateOne(
           { _id: new ObjectId(id) },
           {
@@ -290,11 +491,17 @@ async function run() {
           },
         );
 
-        // If rider was not found
-        if (result.matchedCount === 0) {
-          return res.status(404).send({
-            message: "Rider not found",
-          });
+        // If rider becomes active,
+        // change the user's role from "user" to "rider"
+        if (status === "active") {
+          await usersCollection.updateOne(
+            { email: rider.email },
+            {
+              $set: {
+                role: "rider",
+              },
+            },
+          );
         }
 
         // Send success response
@@ -303,6 +510,7 @@ async function run() {
           modifiedCount: result.modifiedCount,
         });
       } catch (error) {
+        // Handle server/database errors
         console.error("Failed to update rider status:", error);
 
         res.status(500).send({
