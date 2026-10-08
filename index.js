@@ -64,7 +64,6 @@ async function run() {
       }
     };
 
-
     // verify admin
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded.email;
@@ -181,39 +180,44 @@ async function run() {
     });
 
     // Make a user admin
-    app.patch("/users/:id/make-admin", verifyFBToken, verifyAdmin, async (req, res) => {
-      try {
-        const id = req.params.id;
+    app.patch(
+      "/users/:id/make-admin",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
 
-        // Update user's role to admin
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              role: "admin",
+          // Update user's role to admin
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                role: "admin",
+              },
             },
-          },
-        );
+          );
 
-        // User not found
-        if (result.matchedCount === 0) {
-          return res.status(404).send({
-            message: "User not found",
+          // User not found
+          if (result.matchedCount === 0) {
+            return res.status(404).send({
+              message: "User not found",
+            });
+          }
+
+          // Successfully made admin
+          res.send({
+            message: "User is now an admin",
+          });
+        } catch (error) {
+          console.error("Failed to make admin:", error);
+
+          res.status(500).send({
+            message: "Failed to make admin",
           });
         }
-
-        // Successfully made admin
-        res.send({
-          message: "User is now an admin",
-        });
-      } catch (error) {
-        console.error("Failed to make admin:", error);
-
-        res.status(500).send({
-          message: "Failed to make admin",
-        });
-      }
-    });
+      },
+    );
 
     // Remove admin role from a user
     app.patch("/users/:id/remove-admin", async (req, res) => {
@@ -287,9 +291,19 @@ async function run() {
 
     app.get("/parcels", verifyFBToken, async (req, res) => {
       try {
-        const { email } = req.query;
+        const { email, payment_status, delivery_status } = req.query;
+        let query = {};
+        if (email) {
+          query = { createdBy: email };
+        }
+        if (payment_status) {
+          query.payment_status = payment_status;
+        }
+        if (delivery_status) {
+          query.delivery_status = delivery_status;
+        }
 
-        const query = email ? { createdBy: email } : {};
+        console.log("parcel query", req.query, query);
 
         const parcels = await parcelsCollection
           .find(query)
@@ -456,6 +470,99 @@ async function run() {
 
         res.status(500).send({
           message: "Failed to get active riders",
+        });
+      }
+    });
+
+    // Get active riders by district, fallback to region
+    app.get("/riders", verifyFBToken, async (req, res) => {
+      try {
+        const { region, district } = req.query;
+
+        console.log("Requested region:", region);
+        console.log("Requested district:", district);
+
+        if (!region || !district) {
+          return res.status(400).send({
+            message: "Region and district are required",
+          });
+        }
+
+        // First: find active riders from the same district
+        const districtRiders = await ridersCollection
+          .find({
+            region: region,
+            district: district,
+            status: "active",
+          })
+          .toArray();
+
+        // If same district riders exist, return them
+        if (districtRiders.length > 0) {
+          console.log("Same district riders:", districtRiders);
+
+          return res.send(districtRiders);
+        }
+
+        // If no same district rider, find active riders from same region
+        const regionRiders = await ridersCollection
+          .find({
+            region: region,
+            status: "active",
+          })
+          .toArray();
+
+        console.log("Same region riders:", regionRiders);
+
+        res.send(regionRiders);
+      } catch (error) {
+        console.error("Failed to get riders:", error);
+
+        res.status(500).send({
+          message: "Failed to get riders",
+        });
+      }
+    });
+
+    // Assign rider to a parcel
+    app.patch("/parcels/:id/assign-rider", verifyFBToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { rider } = req.body;
+
+        // Update parcel with assigned rider
+        const result = await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              assignedRider: {
+                name: rider.name,
+                email: rider.email,
+                region: rider.region,
+                district: rider.district,
+              },
+              delivery_status: "rider_assigned",
+            },
+          },
+        );
+
+        // Parcel not found
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            message: "Parcel not found",
+          });
+        }
+
+        // Send success response
+        res.send({
+          message: "Rider assigned successfully",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Failed to assign rider:", error);
+
+        res.status(500).send({
+          message: "Failed to assign rider",
         });
       }
     });
