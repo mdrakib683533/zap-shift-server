@@ -39,6 +39,7 @@ async function run() {
     const paymentsCollection = db.collection("payments");
     const trackingCollection = db.collection("tracking");
     const ridersCollection = db.collection("riders");
+    const cashoutsCollection = db.collection("cashouts");
 
     // =========================
     // Custom Middleware
@@ -74,6 +75,397 @@ async function run() {
       }
       next();
     };
+
+    // verify rider
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded.email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+      if (!user || user.role !== "rider") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    // Get all cash out requests for admin
+    app.get("/admin/cashouts", verifyFBToken, verifyAdmin, async (req, res) => {
+      try {
+        // Get all cash out requests
+        const cashouts = await cashoutsCollection
+          .find({})
+          .sort({ requestedAt: -1 })
+          .toArray();
+
+        // Send cash out requests
+        res.send(cashouts);
+      } catch (error) {
+        console.error("Failed to get admin cash outs:", error);
+
+        res.status(500).send({
+          message: "Failed to get cash out requests",
+        });
+      }
+    });
+
+    // Mark a cash out request as paid by admin
+    app.patch(
+      "/admin/cashouts/:id/pay",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          // Find the cash out request
+          const cashout = await cashoutsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          // Check if request exists
+          if (!cashout) {
+            return res.status(404).send({
+              message: "Cash out request not found",
+            });
+          }
+
+          // Prevent paying an already paid request
+          if (cashout.status === "paid") {
+            return res.status(400).send({
+              message: "This request has already been paid",
+            });
+          }
+
+          // Update status and payment time
+          const result = await cashoutsCollection.updateOne(
+            {
+              _id: new ObjectId(id),
+              status: "requested",
+            },
+            {
+              $set: {
+                status: "paid",
+                paidAt: new Date(),
+              },
+            },
+          );
+
+          // Check if request was updated
+          if (result.modifiedCount === 0) {
+            return res.status(400).send({
+              message: "Cash out request could not be updated",
+            });
+          }
+
+          // Send success response
+          res.send({
+            success: true,
+            message: "Cash out marked as paid successfully",
+          });
+        } catch (error) {
+          console.error("Failed to mark cash out as paid:", error);
+
+          res.status(500).send({
+            message: "Failed to update cash out status",
+          });
+        }
+      },
+    );
+
+    // Create cash out request for a completed delivery
+    app.post("/cashouts", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        const { parcelId } = req.body;
+
+        // Check parcel ID
+        if (!parcelId) {
+          return res.status(400).send({
+            message: "Parcel ID is required",
+          });
+        }
+
+        // Find the parcel
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(parcelId),
+        });
+
+        if (!parcel) {
+          return res.status(404).send({
+            message: "Parcel not found",
+          });
+        }
+
+        // Get rider email from Firebase token
+        const riderEmail = req.decoded.email;
+
+        // Check this parcel belongs to this rider
+        if (parcel.assignedRider?.email !== riderEmail) {
+          return res.status(403).send({
+            message: "You cannot cash out this delivery",
+          });
+        }
+
+        // Check delivery is completed
+        if (
+          !["delivered", "service_center_delivered"].includes(
+            parcel.delivery_status,
+          )
+        ) {
+          return res.status(400).send({
+            message: "This delivery is not completed yet",
+          });
+        }
+
+        // Check if cash out already exists
+        const existingCashout = await cashoutsCollection.findOne({
+          parcelId: parcelId,
+        });
+
+        if (existingCashout) {
+          return res.status(400).send({
+            message: "Cash out request already exists for this delivery",
+          });
+        }
+
+        // Check same district
+        const sameDistrict =
+          parcel.sender?.district?.toLowerCase() ===
+          parcel.receiver?.district?.toLowerCase();
+
+        // Same district = 80%, different district = 30%
+        const earningRate = sameDistrict ? 0.8 : 0.3;
+
+        // Get delivery fee
+        const deliveryFee = Number(parcel.deliveryCost) || 0;
+
+        // Calculate rider earning
+        const earningAmount = Number((deliveryFee * earningRate).toFixed(2));
+
+        // Create cash out request
+        const cashout = {
+          parcelId: parcelId,
+          trackingId: parcel.trackingId,
+
+          riderEmail: riderEmail,
+          riderName: parcel.assignedRider?.name,
+
+          earningAmount: earningAmount,
+
+          status: "requested",
+
+          requestedAt: new Date(),
+          paidAt: null,
+        };
+
+        const result = await cashoutsCollection.insertOne(cashout);
+
+        res.send({
+          success: true,
+          message: "Cash out request created successfully",
+          cashoutId: result.insertedId,
+          earningAmount: earningAmount,
+        });
+      } catch (error) {
+        console.error("Failed to create cash out request:", error);
+
+        res.status(500).send({
+          message: "Failed to create cash out request",
+        });
+      }
+    });
+
+    // Get cash out summary for a rider
+    app.get(
+      "/cashouts/summary",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        try {
+          // Get rider email from Firebase token
+          const riderEmail = req.decoded.email;
+
+          // Get all completed deliveries assigned to this rider
+          const completedDeliveries = await parcelsCollection
+            .find({
+              "assignedRider.email": riderEmail,
+              delivery_status: {
+                $in: ["delivered", "service_center_delivered"],
+              },
+            })
+            .toArray();
+
+          // Calculate rider earning for one parcel
+          const calculateEarning = (parcel) => {
+            const sameDistrict =
+              parcel.sender?.district?.toLowerCase() ===
+              parcel.receiver?.district?.toLowerCase();
+
+            // Same district: 80%, different district: 30%
+            const earningRate = sameDistrict ? 0.8 : 0.3;
+            const deliveryFee = Number(parcel.deliveryCost) || 0;
+
+            return Number((deliveryFee * earningRate).toFixed(2));
+          };
+
+          // Get date in Bangladesh timezone (YYYY-MM-DD)
+          const getBangladeshDate = (value) => {
+            if (!value) return null;
+
+            const date = new Date(value);
+
+            if (Number.isNaN(date.getTime())) return null;
+
+            const parts = new Intl.DateTimeFormat("en-CA", {
+              timeZone: "Asia/Dhaka",
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+            }).formatToParts(date);
+
+            const year = parts.find((part) => part.type === "year").value;
+            const month = parts.find((part) => part.type === "month").value;
+            const day = parts.find((part) => part.type === "day").value;
+
+            return `${year}-${month}-${day}`;
+          };
+
+          // Get today's date in Bangladesh
+          const today = getBangladeshDate(new Date());
+
+          // Get current month and year
+          const currentMonth = today.slice(0, 7);
+          const currentYear = today.slice(0, 4);
+
+          // Find Monday of the current week
+          const weekStartDate = new Date(`${today}T00:00:00Z`);
+          const dayOfWeek = weekStartDate.getUTCDay();
+          const daysSinceMonday = (dayOfWeek + 6) % 7;
+
+          weekStartDate.setUTCDate(
+            weekStartDate.getUTCDate() - daysSinceMonday,
+          );
+
+          const weekStart = weekStartDate.toISOString().slice(0, 10);
+
+          // Calculate total earnings from all completed deliveries
+          const totalEarnings = Number(
+            completedDeliveries
+              .reduce((total, parcel) => {
+                return total + calculateEarning(parcel);
+              }, 0)
+              .toFixed(2),
+          );
+
+          // Calculate income for today, this week, this month, and this year
+          const incomeSummary = {
+            todayIncome: 0,
+            thisWeekIncome: 0,
+            thisMonthIncome: 0,
+            thisYearIncome: 0,
+          };
+
+          completedDeliveries.forEach((parcel) => {
+            // Use the actual delivery completion date
+            const deliveryDate = getBangladeshDate(parcel.deliveredAt);
+
+            // Skip period calculations if delivery date is unavailable
+            if (!deliveryDate) return;
+
+            const earning = calculateEarning(parcel);
+
+            // Today's income
+            if (deliveryDate === today) {
+              incomeSummary.todayIncome += earning;
+            }
+
+            // This week's income (Monday to today)
+            if (deliveryDate >= weekStart && deliveryDate <= today) {
+              incomeSummary.thisWeekIncome += earning;
+            }
+
+            // This month's income
+            if (deliveryDate.slice(0, 7) === currentMonth) {
+              incomeSummary.thisMonthIncome += earning;
+            }
+
+            // This year's income
+            if (deliveryDate.slice(0, 4) === currentYear) {
+              incomeSummary.thisYearIncome += earning;
+            }
+          });
+
+          // Round income values to two decimal places
+          Object.keys(incomeSummary).forEach((key) => {
+            incomeSummary[key] = Number(incomeSummary[key].toFixed(2));
+          });
+
+          // Get all cash out requests for this rider
+          const cashouts = await cashoutsCollection
+            .find({ riderEmail })
+            .toArray();
+
+          // Calculate requested amount
+          const requestedAmount = cashouts
+            .filter((cashout) => cashout.status === "requested")
+            .reduce(
+              (total, cashout) => total + (Number(cashout.earningAmount) || 0),
+              0,
+            );
+
+          // Calculate paid amount
+          const cashedOut = cashouts
+            .filter((cashout) => cashout.status === "paid")
+            .reduce(
+              (total, cashout) => total + (Number(cashout.earningAmount) || 0),
+              0,
+            );
+
+          // Calculate available balance
+          const availableBalance = Number(
+            Math.max(0, totalEarnings - requestedAmount - cashedOut).toFixed(2),
+          );
+
+          // Send cash out summary and income breakdown
+          res.send({
+            totalEarnings,
+            availableBalance,
+            requestedAmount: Number(requestedAmount.toFixed(2)),
+            cashedOut: Number(cashedOut.toFixed(2)),
+
+            // Income by period
+            ...incomeSummary,
+          });
+        } catch (error) {
+          console.error("Failed to get cash out summary:", error);
+
+          res.status(500).send({
+            message: "Failed to get cash out summary",
+          });
+        }
+      },
+    );
+
+    // Get cash out history for a rider
+    app.get("/cashouts", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        // Get rider email from Firebase token
+        const riderEmail = req.decoded.email;
+
+        // Find this rider's cash out history
+        const cashouts = await cashoutsCollection
+          .find({ riderEmail })
+          .sort({ requestedAt: -1 })
+          .toArray();
+
+        // Send cash out history
+        res.send(cashouts);
+      } catch (error) {
+        console.error("Failed to get cash out history:", error);
+
+        res.status(500).send({
+          message: "Failed to get cash out history",
+        });
+      }
+    });
 
     // Search a user by email
     app.get("/users/search", async (req, res) => {
@@ -520,6 +912,182 @@ async function run() {
 
         res.status(500).send({
           message: "Failed to get riders",
+        });
+      }
+    });
+
+    // get pending delivery tasks for a rider
+    app.get("/rider/tasks", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        const { email } = req.query;
+
+        // Check rider email
+        if (!email) {
+          return res.status(400).send({
+            message: "Rider email is required",
+          });
+        }
+
+        // Find rider's pending and in-progress delivery tasks
+        const query = {
+          "assignedRider.email": email,
+          delivery_status: {
+            $in: ["rider_assigned", "in_transit"],
+          },
+        };
+
+        const tasks = await parcelsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(tasks);
+      } catch (error) {
+        console.error("Failed to get rider tasks:", error);
+
+        res.status(500).send({
+          message: "Failed to get rider tasks",
+        });
+      }
+    });
+
+    // Get completed deliveries for a rider
+    app.get(
+      "/rider/completed-deliveries",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        try {
+          const { email } = req.query;
+
+          if (!email) {
+            return res.status(400).send({
+              message: "Rider email is required",
+            });
+          }
+
+          // Find completed deliveries of this rider
+          const query = {
+            "assignedRider.email": email,
+            delivery_status: {
+              $in: ["delivered", "service_center_delivered"],
+            },
+          };
+
+          const completedDeliveries = await parcelsCollection
+            .find(query)
+            .sort({ deliveredAt: -1, createdAt: -1 })
+            .toArray();
+
+          // Calculate rider earning for each completed delivery
+          const deliveriesWithEarnings = completedDeliveries.map((parcel) => {
+            // Check if sender and receiver are in the same district
+            const sameDistrict =
+              parcel.sender?.district?.toLowerCase() ===
+              parcel.receiver?.district?.toLowerCase();
+
+            // Same district = 80%, different district = 30%
+            const earningRate = sameDistrict ? 0.8 : 0.3;
+
+            // Get delivery fee
+            const deliveryFee = Number(parcel.deliveryCost) || 0;
+
+            // Calculate rider earning
+            const riderEarning = Number((deliveryFee * earningRate).toFixed(2));
+
+            return {
+              ...parcel,
+
+              // Delivery information
+              deliveryFee,
+              earningRate: earningRate * 100,
+              riderEarning,
+
+              // Pickup and delivery time
+              pickedUpAt: parcel.pickedUpAt || null,
+              deliveredAt: parcel.deliveredAt || null,
+            };
+          });
+
+          // Calculate total rider earnings
+          const totalEarnings = Number(
+            deliveriesWithEarnings
+              .reduce((total, parcel) => total + parcel.riderEarning, 0)
+              .toFixed(2),
+          );
+
+          // Send completed deliveries and earnings
+          res.send({
+            totalDeliveries: deliveriesWithEarnings.length,
+            totalEarnings,
+            deliveries: deliveriesWithEarnings,
+          });
+        } catch (error) {
+          console.error("Failed to get completed deliveries:", error);
+
+          res.status(500).send({
+            message: "Failed to get completed deliveries",
+          });
+        }
+      },
+    );
+
+    // Update rider delivery status
+    app.patch("/rider/tasks/:id/status", verifyFBToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        // Only allow these status updates
+        if (!["in_transit", "delivered"].includes(status)) {
+          return res.status(400).send({
+            message: "Invalid delivery status",
+          });
+        }
+
+        // Find the parcel
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!parcel) {
+          return res.status(404).send({
+            message: "Parcel not found",
+          });
+        }
+
+        // Prepare fields to update
+        const updateFields = {
+          delivery_status: status,
+        };
+
+        // Save pickup time when the parcel is picked up
+        if (status === "in_transit") {
+          updateFields.pickedUpAt = new Date();
+        }
+
+        // Save delivery time when the parcel is delivered
+        if (status === "delivered") {
+          updateFields.deliveredAt = new Date();
+        }
+
+        // Update parcel status and timestamps
+        const result = await parcelsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: updateFields,
+          },
+        );
+
+        res.send({
+          message: "Delivery status updated successfully",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Failed to update delivery status:", error);
+
+        res.status(500).send({
+          message: "Failed to update delivery status",
         });
       }
     });
