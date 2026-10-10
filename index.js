@@ -107,6 +107,212 @@ async function run() {
       }
     });
 
+    // Admin dashboard KPI statistics
+    app.get(
+      "/admin/dashboard-stats",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          // Count all parcels
+          const totalParcels = await parcelsCollection.countDocuments();
+
+          // Count parcels currently in transit
+          const inTransit = await parcelsCollection.countDocuments({
+            delivery_status: "in_transit",
+          });
+
+          // Count delivered parcels
+          const delivered = await parcelsCollection.countDocuments({
+            delivery_status: "delivered",
+          });
+
+          // Calculate total successful payments
+          const paymentResult = await paymentsCollection
+            .aggregate([
+              { $match: { payment_status: "paid" } },
+              { $group: { _id: null, total: { $sum: "$amount" } } },
+            ])
+            .toArray();
+
+          const totalPayments = paymentResult[0]?.total || 0;
+
+          // Send dashboard statistics
+          res.send({
+            totalParcels,
+            inTransit,
+            delivered,
+            totalPayments,
+          });
+        } catch (error) {
+          console.error("Failed to get admin dashboard stats:", error);
+
+          res.status(500).send({
+            message: "Failed to get admin dashboard statistics",
+          });
+        }
+      },
+    );
+
+    // Admin dashboard delivery status statistics
+    app.get(
+      "/admin/delivery-status-stats",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          // Count parcels by delivery status
+          const result = await parcelsCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: "$delivery_status",
+                  count: { $sum: 1 },
+                },
+              },
+            ])
+            .toArray();
+
+          // Send status statistics
+          res.send(result);
+        } catch (error) {
+          console.error("Failed to get delivery status stats:", error);
+
+          res.status(500).send({
+            message: "Failed to get delivery status statistics",
+          });
+        }
+      },
+    );
+
+    // Admin dashboard monthly delivery statistics
+    app.get(
+      "/admin/monthly-deliveries",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          // Group delivered parcels by year and month
+          const result = await parcelsCollection
+            .aggregate([
+              {
+                $match: {
+                  delivery_status: "delivered",
+                  deliveredAt: { $exists: true },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    year: {
+                      $year: { $toDate: "$deliveredAt" },
+                    },
+                    month: {
+                      $month: { $toDate: "$deliveredAt" },
+                    },
+                  },
+                  deliveries: { $sum: 1 },
+                },
+              },
+              {
+                $sort: {
+                  "_id.year": 1,
+                  "_id.month": 1,
+                },
+              },
+            ])
+            .toArray();
+
+          // Convert month numbers into readable labels
+          const monthlyData = result.map((item) => ({
+            month: `${item._id.year}-${String(item._id.month).padStart(2, "0")}`,
+            deliveries: item.deliveries,
+          }));
+
+          res.send(monthlyData);
+        } catch (error) {
+          console.error("Failed to get monthly deliveries:", error);
+
+          res.status(500).send({
+            message: "Failed to get monthly delivery statistics",
+          });
+        }
+      },
+    );
+
+    // Admin dashboard: get recent parcels
+    app.get(
+      "/admin/recent-parcels",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const parcels = await parcelsCollection
+            .find({})
+            .sort({ createdAt: -1 })
+            .limit(5)
+            .toArray();
+
+          res.send(parcels);
+        } catch (error) {
+          console.error("Failed to get recent parcels:", error);
+
+          res.status(500).send({
+            message: "Failed to get recent parcels",
+          });
+        }
+      },
+    );
+
+    // Admin dashboard: get recent payments
+    app.get(
+      "/admin/recent-payments",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          // Get the latest 5 payments
+          const payments = await paymentsCollection
+            .find({ payment_status: "paid" })
+            .sort({ paid_at: -1 })
+            .limit(5)
+            .toArray();
+
+          // Send recent payments to the admin
+          res.send(payments);
+        } catch (error) {
+          console.error("Failed to get recent payments:", error);
+
+          res.status(500).send({
+            message: "Failed to get recent payments",
+          });
+        }
+      },
+    );
+    
+
+    // Get total pending riders count
+    app.get(
+      "/admin/pending-riders-count",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const count = await ridersCollection.countDocuments({
+            status: "pending",
+          });
+
+          res.send({ count });
+        } catch (error) {
+          console.error("Failed to get pending riders count:", error);
+
+          res.status(500).send({
+            message: "Failed to get pending riders count",
+          });
+        }
+      },
+    );
+
     // Mark a cash out request as paid by admin
     app.patch(
       "/admin/cashouts/:id/pay",
@@ -744,17 +950,40 @@ async function run() {
     // Add New Parcel
     // =========================
 
+    // Add a new parcel and create its first tracking update
     app.post("/parcels", async (req, res) => {
       try {
+        // Get parcel data from client
         const parcel = req.body;
 
+        // Save parcel to database
         const result = await parcelsCollection.insertOne(parcel);
 
-        res.send(result);
+        // Create the first tracking history
+        const trackingInfo = {
+          parcelId: result.insertedId.toString(),
+          trackingId: parcel.trackingId,
+          status: "parcel_submitted",
+          message: "Parcel submitted successfully",
+          location: parcel.sender?.district || "Unknown",
+          createdAt: new Date(),
+        };
+
+        // Save tracking history
+        await trackingCollection.insertOne(trackingInfo);
+
+        // Send success response
+        res.send({
+          success: true,
+          message: "Parcel added successfully with tracking history",
+          insertedId: result.insertedId,
+          trackingId: parcel.trackingId,
+        });
       } catch (error) {
         console.error("Failed to add parcel:", error);
 
         res.status(500).send({
+          success: false,
           message: "Failed to add parcel",
         });
       }
@@ -786,23 +1015,53 @@ async function run() {
     // Tracking
     // =========================
 
+    // Get tracking updates by tracking ID
+    app.get("/tracking/:trackingId", async (req, res) => {
+      try {
+        // Get tracking ID from URL
+        const { trackingId } = req.params;
+
+        // Find all tracking updates for this parcel
+        const trackingUpdates = await trackingCollection
+          .find({ trackingId })
+          .sort({ createdAt: 1 })
+          .toArray();
+
+        // Return tracking updates
+        res.send(trackingUpdates);
+      } catch (error) {
+        console.error("Failed to get tracking updates:", error);
+
+        res.status(500).send({
+          message: "Failed to get tracking updates",
+        });
+      }
+    });
+
+    // Add a new tracking update
     app.post("/tracking", async (req, res) => {
       try {
+        // Get tracking information from client
+        // Add the current date and time
         const trackingInfo = {
           ...req.body,
           createdAt: new Date(),
         };
 
+        // Save tracking information to MongoDB
         const result = await trackingCollection.insertOne(trackingInfo);
 
+        // Send success response to client
         res.send({
           success: true,
           message: "Tracking update added successfully",
           trackingId: result.insertedId,
         });
       } catch (error) {
+        // Log the error in the server terminal
         console.error("Failed to add tracking update:", error);
 
+        // Send error response to client
         res.status(500).send({
           success: false,
           message: "Failed to add tracking update",
@@ -1032,13 +1291,14 @@ async function run() {
       },
     );
 
-    // Update rider delivery status
+    // Update rider delivery status and tracking history
     app.patch("/rider/tasks/:id/status", verifyFBToken, async (req, res) => {
       try {
+        // Get parcel ID and new status
         const { id } = req.params;
         const { status } = req.body;
 
-        // Only allow these status updates
+        // Allow only valid delivery status updates
         if (!["in_transit", "delivered"].includes(status)) {
           return res.status(400).send({
             message: "Invalid delivery status",
@@ -1050,40 +1310,60 @@ async function run() {
           _id: new ObjectId(id),
         });
 
+        // Return error if parcel does not exist
         if (!parcel) {
           return res.status(404).send({
             message: "Parcel not found",
           });
         }
 
-        // Prepare fields to update
+        // Prepare parcel update fields
         const updateFields = {
           delivery_status: status,
         };
 
-        // Save pickup time when the parcel is picked up
+        // Save pickup time when parcel is collected
         if (status === "in_transit") {
           updateFields.pickedUpAt = new Date();
         }
 
-        // Save delivery time when the parcel is delivered
+        // Save delivery time when parcel is delivered
         if (status === "delivered") {
           updateFields.deliveredAt = new Date();
         }
 
-        // Update parcel status and timestamps
-        const result = await parcelsCollection.updateOne(
+        // Update parcel status in MongoDB
+        await parcelsCollection.updateOne(
           { _id: new ObjectId(id) },
-          {
-            $set: updateFields,
-          },
+          { $set: updateFields },
         );
 
+        // Prepare a new tracking history entry
+        const trackingInfo = {
+          parcelId: id,
+          trackingId: parcel.trackingId,
+          status,
+          message:
+            status === "in_transit"
+              ? "Parcel has been picked up and is in transit"
+              : "Parcel has been delivered successfully",
+          location:
+            status === "in_transit"
+              ? parcel.sender?.district || "Unknown"
+              : parcel.receiver?.district || "Unknown",
+          createdAt: new Date(),
+        };
+
+        // Save tracking history separately
+        await trackingCollection.insertOne(trackingInfo);
+
+        // Send success response
         res.send({
-          message: "Delivery status updated successfully",
-          modifiedCount: result.modifiedCount,
+          success: true,
+          message: "Delivery status and tracking history updated successfully",
         });
       } catch (error) {
+        // Handle server or database errors
         console.error("Failed to update delivery status:", error);
 
         res.status(500).send({
