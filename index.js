@@ -984,7 +984,7 @@ async function run() {
     // =========================
 
     // Add a new parcel and create its first tracking update
-    app.post("/parcels", async (req, res) => {
+    app.post("/parcels", verifyFBToken, async (req, res) => {
       try {
         // Get parcel data from client
         const parcel = req.body;
@@ -1544,12 +1544,69 @@ async function run() {
     // Record Payment
     // =========================
 
-    app.post("/payments", async (req, res) => {
-      const { parcelId, transactionId, paymentMethod, amount, userEmail } =
-        req.body;
-
+    app.post("/payments", verifyFBToken, async (req, res) => {
       try {
-        // Check if this payment was already saved
+        const { parcelId, transactionId, paymentMethod } = req.body;
+
+        // Step 1: Validate request data
+        if (
+          !ObjectId.isValid(parcelId) ||
+          typeof transactionId !== "string" ||
+          !transactionId.startsWith("pi_")
+        ) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid payment information",
+          });
+        }
+
+        // Step 2: Get the logged-in user's email from the verified token
+        const userEmail = req.decoded.email;
+
+        // Step 3: Find the parcel and verify its owner
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(parcelId),
+          createdBy: userEmail,
+        });
+
+        if (!parcel) {
+          return res.status(404).send({
+            success: false,
+            message: "Parcel not found or access denied",
+          });
+        }
+
+        // Step 4: Verify the real PaymentIntent with Stripe
+        const paymentIntent =
+          await stripe.paymentIntents.retrieve(transactionId);
+
+        if (
+          paymentIntent.status !== "succeeded" ||
+          paymentIntent.metadata.parcelId !== parcelId ||
+          paymentIntent.metadata.userEmail !== userEmail ||
+          paymentIntent.currency !== "usd"
+        ) {
+          return res.status(400).send({
+            success: false,
+            message: "Payment verification failed",
+          });
+        }
+
+        // Step 5: Verify the amount using trusted parcel data
+        const expectedAmount = Math.round(Number(parcel.deliveryCost) * 100);
+
+        if (
+          !Number.isSafeInteger(expectedAmount) ||
+          expectedAmount <= 0 ||
+          paymentIntent.amount !== expectedAmount
+        ) {
+          return res.status(400).send({
+            success: false,
+            message: "Payment amount verification failed",
+          });
+        }
+
+        // Step 6: Prevent saving the same transaction twice
         const existingPayment = await paymentsCollection.findOne({
           transactionId,
         });
@@ -1562,9 +1619,13 @@ async function run() {
           });
         }
 
-        // Update parcel payment status
+        // Step 7: Update only a parcel that has not already been paid
         const parcelResult = await parcelsCollection.updateOne(
-          { _id: new ObjectId(parcelId) },
+          {
+            _id: parcel._id,
+            createdBy: userEmail,
+            payment_status: { $ne: "paid" },
+          },
           {
             $set: {
               payment_status: "paid",
@@ -1572,20 +1633,21 @@ async function run() {
           },
         );
 
-        if (parcelResult.matchedCount === 0) {
-          return res.status(404).send({
+        if (parcelResult.modifiedCount === 0) {
+          return res.status(409).send({
             success: false,
-            message: "Parcel not found",
+            message: "Parcel is already paid or has changed",
           });
         }
 
-        // Save payment history
+        // Step 8: Save verified payment history
         const paymentInfo = {
-          parcelId,
+          parcelId: parcel._id.toString(),
           userEmail,
-          amount,
-          paymentMethod,
-          transactionId,
+          amount: parcel.deliveryCost,
+          paymentMethod:
+            paymentIntent.payment_method_types?.[0] || paymentMethod || "card",
+          transactionId: paymentIntent.id,
           payment_status: "paid",
           paid_at: new Date(),
         };
@@ -1594,15 +1656,15 @@ async function run() {
 
         res.send({
           success: true,
-          message: "Payment successful and history saved",
+          message: "Payment verified and history saved",
           paymentId: paymentResult.insertedId,
         });
       } catch (error) {
-        console.error("Payment save error:", error);
+        console.error("Payment verification error:", error);
 
         res.status(500).send({
           success: false,
-          message: error.message,
+          message: "Failed to verify and save payment",
         });
       }
     });
@@ -1611,21 +1673,70 @@ async function run() {
     // Create Payment Intent
     // =========================
 
-    app.post("/create-payment-intent", async (req, res) => {
-      const amountInCents = req.body.amountInCents;
-
+    // Create Stripe PaymentIntent securely
+    app.post("/create-payment-intent", verifyFBToken, async (req, res) => {
       try {
+        const { parcelId } = req.body;
+
+        // Validate parcel ID
+        if (!ObjectId.isValid(parcelId)) {
+          return res.status(400).send({
+            message: "Invalid parcel ID",
+          });
+        }
+
+        // Find parcel in database
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(parcelId),
+        });
+
+        if (!parcel) {
+          return res.status(404).send({
+            message: "Parcel not found",
+          });
+        }
+
+        // Ensure the logged-in user owns this parcel
+        if (parcel.createdBy !== req.decoded.email) {
+          return res.status(403).send({
+            message: "You cannot pay for this parcel",
+          });
+        }
+
+        // Prevent duplicate payment
+        if (parcel.payment_status === "paid") {
+          return res.status(400).send({
+            message: "This parcel has already been paid",
+          });
+        }
+
+        // Calculate amount from trusted database data
+        const amountInCents = Math.round(Number(parcel.deliveryCost) * 100);
+
+        if (!Number.isSafeInteger(amountInCents) || amountInCents <= 0) {
+          return res.status(400).send({
+            message: "Invalid parcel delivery cost",
+          });
+        }
+
+        // Create Stripe PaymentIntent
         const paymentIntent = await stripe.paymentIntents.create({
           amount: amountInCents,
           currency: "usd",
+          metadata: {
+            parcelId: parcel._id.toString(),
+            userEmail: req.decoded.email,
+          },
         });
 
-        res.json({
+        res.send({
           clientSecret: paymentIntent.client_secret,
         });
       } catch (error) {
-        res.status(500).json({
-          error: error.message,
+        console.error("Create payment intent error:", error);
+
+        res.status(500).send({
+          message: "Failed to create payment intent",
         });
       }
     });
