@@ -29,6 +29,37 @@ const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster
 
 const client = new MongoClient(uri);
 
+// Wait for database initialization before handling requests
+let runPromise;
+let startupError = null;
+
+app.use(async (req, res, next) => {
+  // Keep the health-check endpoint available
+  if (req.path === "/") {
+    return next();
+  }
+
+  try {
+    if (runPromise) {
+      await runPromise;
+    }
+
+    if (startupError) {
+      return res.status(503).send({
+        message: "Database connection failed",
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error("Server initialization failed:", error);
+
+    res.status(503).send({
+      message: "Server initialization failed",
+    });
+  }
+});
+
 async function run() {
   try {
     await client.connect();
@@ -1601,11 +1632,12 @@ async function run() {
 
     console.log("All routes are ready");
   } catch (error) {
+    startupError = error;
     console.error("MongoDB connection failed:", error);
   }
 }
 
-run();
+runPromise = run();
 
 // =========================
 // Test Route
