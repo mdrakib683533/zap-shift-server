@@ -62,8 +62,34 @@ app.use(async (req, res, next) => {
 
 async function run() {
   try {
-    await client.connect();
-    console.log("MongoDB connected successfully");
+    // Retry MongoDB connection up to 3 times
+    let connected = false;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await client.connect();
+        connected = true;
+        startupError = null;
+
+        console.log("MongoDB connected successfully");
+        break;
+      } catch (error) {
+        console.error(
+          `MongoDB connection attempt ${attempt} failed:`,
+          error.message,
+        );
+
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        }
+      }
+    }
+
+    if (!connected) {
+      throw new Error("MongoDB connection failed after 3 attempts");
+    }
+
+    
 
     const db = client.db("zapShiftDB");
 
