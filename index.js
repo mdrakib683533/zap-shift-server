@@ -16,7 +16,10 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-const serviceAccount = require("./firebase-admin-key.json");
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : require("./firebase-admin-key.json");
+
 initializeApp({
   credential: cert(serviceAccount),
 });
@@ -289,7 +292,6 @@ async function run() {
         }
       },
     );
-    
 
     // Get total pending riders count
     app.get(
@@ -1617,6 +1619,10 @@ app.get("/", (req, res) => {
 // Start Server
 // =========================
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+if (process.env.VERCEL !== "1") {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+module.exports = app;
